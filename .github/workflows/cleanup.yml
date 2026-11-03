@@ -1,0 +1,53 @@
+name: Clean OpenEUICC build history
+
+on:
+  workflow_run:
+    workflows: [Build OpenEUICC]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Wait for the retention period
+        env:
+          CLEANUP_DELAY: ${{ github.event.workflow_run.conclusion == 'success' && '60' || '1200' }}
+        run: sleep "$CLEANUP_DELAY"
+      - name: Remove eligible build runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPO/actions/workflows/build.yml/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[] |
+              select((.updated_at | fromdateiso8601) <= (now - (if .conclusion == "success" then 60 else 1200 end))) |
+              [.id, .run_attempt, .conclusion] | @tsv' > "$RUNNER_TEMP/completed-runs.txt"
+          while IFS=$'\t' read -r id attempt conclusion; do
+            [[ "$id" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ ]] || exit 2
+            if [[ "$conclusion" == success ]]; then
+              if ! release="$(gh api "repos/$GH_REPO/releases/tags/build-$id-$attempt" 2>&1)"; then
+                [[ "$release" == *"(HTTP 404)"* ]] && continue
+                printf '%s\n' "$release" >&2
+                exit 1
+              fi
+              if ! jq -e '
+                .draft == false and
+                (([.assets[] | select(.state == "uploaded" and .size > 0) | .name] | sort) ==
+                  ["EasyEUICC-release.apk", "OpenEUICC-Magisk-release.zip", "OpenEUICC-release.apk", "SHA256SUMS", "sources.lock.json"])
+              ' <<< "$release" >/dev/null; then
+                continue
+              fi
+            fi
+            if ! result="$(gh api --method DELETE "repos/$GH_REPO/actions/runs/$id" 2>&1)"; then
+              [[ "$result" == *"(HTTP 404)"* ]] && continue
+              printf '%s\n' "$result" >&2
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/completed-runs.txt"
